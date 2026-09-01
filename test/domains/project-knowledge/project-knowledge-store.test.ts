@@ -163,6 +163,272 @@ describe('project knowledge local store', () => {
     }
   });
 
+  test('imports missing and newer legacy records without overwriting newer canonical data', async () => {
+    const root = await temporaryRoot('comet-project-knowledge-import-');
+    const storageRoot = await temporaryRoot('comet-project-knowledge-import-storage-');
+    let store: ProjectKnowledgeLocalStore | undefined;
+    try {
+      store = new ProjectKnowledgeLocalStore({ projectRoot: root, storageRoot });
+      await store.apply({
+        kind: 'upsert',
+        record: record({
+          id: 'record-conflict',
+          summary: 'Canonical value',
+          updatedAt: '2026-08-22T00:02:00.000Z',
+        }),
+      });
+
+      store.importSnapshot({
+        records: [
+          record({
+            id: 'record-conflict',
+            summary: 'Older legacy value',
+            updatedAt: '2026-08-22T00:01:00.000Z',
+          }),
+          record({ id: 'record-legacy-only', summary: 'Legacy-only value' }),
+        ],
+        appliedMutations: [],
+        applicationOutcomes: [],
+        feedbackStates: [],
+      });
+      expect(store.read('record-conflict')).toMatchObject({ summary: 'Canonical value' });
+      expect(store.read('record-legacy-only')).toMatchObject({ summary: 'Legacy-only value' });
+
+      store.importSnapshot({
+        records: [
+          record({
+            id: 'record-conflict',
+            summary: 'Newer legacy value',
+            updatedAt: '2026-08-22T00:03:00.000Z',
+          }),
+        ],
+        appliedMutations: [],
+        applicationOutcomes: [],
+        feedbackStates: [],
+      });
+      expect(store.read('record-conflict')).toMatchObject({ summary: 'Newer legacy value' });
+    } finally {
+      store?.close();
+      await fs.rm(root, { recursive: true, force: true });
+      await fs.rm(storageRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('does not overwrite a newer canonical record written during legacy import', async () => {
+    const root = await temporaryRoot('comet-project-knowledge-import-race-');
+    const storageRoot = await temporaryRoot('comet-project-knowledge-import-race-storage-');
+    let store: ProjectKnowledgeLocalStore | undefined;
+    try {
+      store = new ProjectKnowledgeLocalStore({ projectRoot: root, storageRoot });
+      const canonical = record({
+        id: 'record-import-race',
+        summary: 'Initial canonical value',
+        updatedAt: '2026-08-22T00:01:00.000Z',
+      });
+      await store.apply({ kind: 'upsert', record: canonical });
+
+      let wroteConcurrentRecord = false;
+      const incoming = {
+        ...record({
+          id: canonical.id,
+          summary: 'Legacy value',
+          updatedAt: '2026-08-22T00:02:00.000Z',
+        }),
+      };
+      Object.defineProperty(incoming, 'updatedAt', {
+        enumerable: true,
+        get: () => {
+          if (!wroteConcurrentRecord) {
+            wroteConcurrentRecord = true;
+            void store?.apply({
+              kind: 'upsert',
+              record: record({
+                id: canonical.id,
+                summary: 'Concurrent canonical value',
+                updatedAt: '2026-08-22T00:03:00.000Z',
+              }),
+            });
+          }
+          return '2026-08-22T00:02:00.000Z';
+        },
+      });
+
+      store.importSnapshot({
+        records: [incoming],
+        appliedMutations: [],
+        applicationOutcomes: [],
+        feedbackStates: [],
+      });
+      expect(store.read(canonical.id)).toMatchObject({
+        summary: 'Concurrent canonical value',
+        updatedAt: '2026-08-22T00:03:00.000Z',
+      });
+    } finally {
+      store?.close();
+      await fs.rm(root, { recursive: true, force: true });
+      await fs.rm(storageRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('does not attach stale legacy feedback state to a newer canonical record', async () => {
+    const root = await temporaryRoot('comet-project-knowledge-import-feedback-');
+    const storageRoot = await temporaryRoot('comet-project-knowledge-import-feedback-storage-');
+    let store: ProjectKnowledgeLocalStore | undefined;
+    try {
+      store = new ProjectKnowledgeLocalStore({ projectRoot: root, storageRoot });
+      const canonical = record({
+        id: 'record-import-feedback',
+        type: 'constraint',
+        state: 'enforced',
+        verification: [{ command: 'comet native check', expected: 'pass' }],
+        updatedAt: '2026-08-22T00:03:00.000Z',
+      });
+      await store.apply({ kind: 'upsert', record: canonical });
+
+      store.importSnapshot({
+        records: [
+          record({
+            ...canonical,
+            state: 'superseded',
+            applicationCount: 1,
+            failureCount: 1,
+            updatedAt: '2026-08-22T00:02:00.000Z',
+          }),
+        ],
+        appliedMutations: [
+          {
+            mutationKey: 'legacy-feedback-stale-1',
+            appliedAt: '2026-08-22T00:02:00.000Z',
+          },
+        ],
+        applicationOutcomes: [
+          {
+            recordId: canonical.id,
+            applicationId: 'legacy-stale-application',
+            status: 'contributed-to-failure',
+            revision: 1,
+          },
+        ],
+        feedbackStates: [{ recordId: canonical.id, baseState: 'trial' }],
+      });
+
+      await expect(
+        store.apply({
+          kind: 'feedback',
+          id: canonical.id,
+          projectId: canonical.projectId,
+          outcome: 'used-successfully',
+          applicationId: 'legacy-stale-application',
+          revision: 2,
+          idempotencyKey: 'canonical-feedback-newer-2',
+          updatedAt: '2026-08-22T00:04:00.000Z',
+        }),
+      ).resolves.toMatchObject({
+        changed: true,
+        record: expect.objectContaining({
+          state: 'enforced',
+          applicationCount: 1,
+          successCount: 1,
+          failureCount: 0,
+        }),
+      });
+    } finally {
+      store?.close();
+      await fs.rm(root, { recursive: true, force: true });
+      await fs.rm(storageRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('replaces canonical feedback state when the legacy record is newer', async () => {
+    const root = await temporaryRoot('comet-project-knowledge-import-newer-feedback-');
+    const storageRoot = await temporaryRoot(
+      'comet-project-knowledge-import-newer-feedback-storage-',
+    );
+    let store: ProjectKnowledgeLocalStore | undefined;
+    try {
+      store = new ProjectKnowledgeLocalStore({ projectRoot: root, storageRoot });
+      const canonical = record({
+        id: 'record-import-newer-feedback',
+        updatedAt: '2026-08-22T00:01:00.000Z',
+      });
+      await store.apply({ kind: 'upsert', record: canonical });
+      await store.apply({
+        kind: 'feedback',
+        id: canonical.id,
+        projectId: canonical.projectId,
+        outcome: 'used-successfully',
+        applicationId: 'canonical-application',
+        revision: 1,
+        idempotencyKey: 'canonical-feedback-1',
+        updatedAt: '2026-08-22T00:01:30.000Z',
+      });
+
+      store.importSnapshot({
+        records: [
+          record({
+            ...canonical,
+            state: 'superseded',
+            applicationCount: 1,
+            successCount: 0,
+            failureCount: 1,
+            updatedAt: '2026-08-22T00:02:00.000Z',
+          }),
+        ],
+        appliedMutations: [],
+        applicationOutcomes: [
+          {
+            recordId: canonical.id,
+            applicationId: 'legacy-application',
+            status: 'contributed-to-failure',
+            revision: 1,
+          },
+        ],
+        feedbackStates: [{ recordId: canonical.id, baseState: 'trial' }],
+      });
+
+      const database = openProjectKnowledgeDatabase(store.databasePath, { readOnly: true });
+      expect(
+        database
+          .prepare(
+            'SELECT application_id, status, revision FROM pk_application_outcomes WHERE record_id = ?',
+          )
+          .all(canonical.id),
+      ).toEqual([
+        {
+          application_id: 'legacy-application',
+          status: 'contributed-to-failure',
+          revision: 1,
+        },
+      ]);
+      database.close();
+
+      await expect(
+        store.apply({
+          kind: 'feedback',
+          id: canonical.id,
+          projectId: canonical.projectId,
+          outcome: 'used-successfully',
+          applicationId: 'legacy-application',
+          revision: 2,
+          idempotencyKey: 'legacy-feedback-2',
+          updatedAt: '2026-08-22T00:03:00.000Z',
+        }),
+      ).resolves.toMatchObject({
+        changed: true,
+        record: expect.objectContaining({
+          state: 'proven',
+          applicationCount: 1,
+          successCount: 1,
+          failureCount: 0,
+        }),
+      });
+    } finally {
+      store?.close();
+      await fs.rm(root, { recursive: true, force: true });
+      await fs.rm(storageRoot, { recursive: true, force: true });
+    }
+  });
+
   test('supersedes stale records and creates a new version after relearning', async () => {
     const root = await temporaryRoot('comet-project-knowledge-store-refresh-');
     const storageRoot = await temporaryRoot('comet-project-knowledge-storage-refresh-');

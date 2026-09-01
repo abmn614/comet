@@ -1,5 +1,15 @@
-import { closeSync, mkdirSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
+import {
+  closeSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  readSync,
+  rmSync,
+  statSync,
+} from 'node:fs';
 import { createHash } from 'node:crypto';
+import os from 'node:os';
 import path from 'node:path';
 
 import { resolveProjectKnowledgeStorageLocation } from '../../platform/paths/project-knowledge-storage.js';
@@ -25,7 +35,13 @@ import {
 } from './index-store.js';
 import type { ProjectKnowledgeDocument } from './types.js';
 import { projectKnowledgeSourceReferenceMatchesText } from './source-validity.js';
-import { openProjectKnowledgeDatabase, type ProjectKnowledgeDatabase } from './sqlite.js';
+import {
+  backupProjectKnowledgeDatabase,
+  openProjectKnowledgeDatabase,
+  projectKnowledgeDatabaseBackupAvailable,
+  type ProjectKnowledgeDatabase,
+} from './sqlite.js';
+import type { AgentContextOutcomeStatus } from '../agent-learning/index.js';
 
 export interface ProjectKnowledgeLocalStoreOptions extends Omit<
   ProjectKnowledgeIndexOptions,
@@ -47,6 +63,41 @@ interface StoredRecordRow {
   readonly payload_json: string;
 }
 
+interface StoredAppliedMutationRow {
+  readonly mutation_key: unknown;
+  readonly applied_at: unknown;
+}
+
+interface StoredApplicationOutcomeRow {
+  readonly record_id: unknown;
+  readonly application_id: unknown;
+  readonly status: unknown;
+  readonly revision: unknown;
+}
+
+interface StoredFeedbackStateRow {
+  readonly record_id: unknown;
+  readonly base_state: unknown;
+}
+
+export interface ProjectKnowledgeStoreSnapshot {
+  readonly records: readonly ProjectKnowledgeRecord[];
+  readonly appliedMutations: readonly {
+    readonly mutationKey: string;
+    readonly appliedAt: string;
+  }[];
+  readonly applicationOutcomes: readonly {
+    readonly recordId: string;
+    readonly applicationId: string;
+    readonly status: AgentContextOutcomeStatus;
+    readonly revision: number;
+  }[];
+  readonly feedbackStates: readonly {
+    readonly recordId: string;
+    readonly baseState: ProjectKnowledgeRecord['state'];
+  }[];
+}
+
 interface SharedDatabaseEntry {
   database: ProjectKnowledgeDatabase | null;
   refs: number;
@@ -54,6 +105,61 @@ interface SharedDatabaseEntry {
 
 const MAX_SOURCE_VALIDATION_BYTES = 1024 * 1024;
 const PROJECT_KNOWLEDGE_SCHEMA_VERSION = '4';
+const SNAPSHOT_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$/u;
+const AGENT_CONTEXT_OUTCOME_STATUSES = new Set<AgentContextOutcomeStatus>([
+  'used-successfully',
+  'ignored',
+  'overridden',
+  'corrected',
+  'contributed-to-failure',
+]);
+const PROJECT_KNOWLEDGE_RECORD_STATES = new Set<ProjectKnowledgeRecord['state']>([
+  'trial',
+  'proven',
+  'enforced',
+  'superseded',
+]);
+
+function snapshotIdentifier(value: unknown): string | undefined {
+  return typeof value === 'string' && SNAPSHOT_IDENTIFIER.test(value) ? value : undefined;
+}
+
+function snapshotTimestamp(value: unknown): string | undefined {
+  return typeof value === 'string' && !Number.isNaN(Date.parse(value)) ? value : undefined;
+}
+
+function snapshotOutcomeStatus(value: unknown): AgentContextOutcomeStatus | undefined {
+  return typeof value === 'string' &&
+    AGENT_CONTEXT_OUTCOME_STATUSES.has(value as AgentContextOutcomeStatus)
+    ? (value as AgentContextOutcomeStatus)
+    : undefined;
+}
+
+function snapshotRecordState(value: unknown): ProjectKnowledgeRecord['state'] | undefined {
+  return typeof value === 'string' &&
+    PROJECT_KNOWLEDGE_RECORD_STATES.has(value as ProjectKnowledgeRecord['state'])
+    ? (value as ProjectKnowledgeRecord['state'])
+    : undefined;
+}
+
+async function stageDatabaseSnapshot(databasePath: string): Promise<{
+  readonly databasePath: string;
+  readonly temporaryRoot: string;
+}> {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), 'comet-project-knowledge-migration-'));
+  const stagedDatabasePath = path.join(temporaryRoot, path.basename(databasePath));
+  let sourceDatabase: ProjectKnowledgeDatabase | undefined;
+  try {
+    sourceDatabase = openProjectKnowledgeDatabase(databasePath, { readOnly: true });
+    await backupProjectKnowledgeDatabase(sourceDatabase, stagedDatabasePath);
+    return { databasePath: stagedDatabasePath, temporaryRoot };
+  } catch (error) {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+    throw error;
+  } finally {
+    sourceDatabase?.close();
+  }
+}
 
 function equalSourceVersions(left: ProjectKnowledgeRecord, right: ProjectKnowledgeRecord): boolean {
   return JSON.stringify(left.sourceVersions) === JSON.stringify(right.sourceVersions);
@@ -468,6 +574,113 @@ export class ProjectKnowledgeLocalStore {
       .prepare('SELECT payload_json FROM pk_records WHERE id = ?')
       .get(id) as StoredRecordRow | undefined;
     return row ? parseProjectKnowledgeRecord(JSON.parse(row.payload_json)) : null;
+  }
+
+  hasCompletedMigration(migrationKey: string): boolean {
+    return Boolean(
+      this.requireDatabase()
+        .prepare("SELECT value FROM pk_meta WHERE key = ? AND value = 'complete'")
+        .get(migrationKey),
+    );
+  }
+
+  importSnapshot(snapshot: ProjectKnowledgeStoreSnapshot, migrationKey?: string): boolean {
+    const records = snapshot.records.map((incoming) => {
+      const payloadJson = JSON.stringify(incoming);
+      return {
+        id: incoming.id,
+        updatedAt: incoming.updatedAt,
+        values: [
+          incoming.id,
+          incoming.projectId,
+          incoming.type,
+          incoming.state,
+          incoming.authority,
+          payloadJson,
+          JSON.stringify(incoming.sourceVersions),
+          incoming.updatedAt,
+        ],
+      };
+    });
+    const database = this.requireDatabase();
+    database.exec('BEGIN IMMEDIATE;');
+    try {
+      if (
+        migrationKey !== undefined &&
+        database
+          .prepare("SELECT value FROM pk_meta WHERE key = ? AND value = 'complete'")
+          .get(migrationKey)
+      ) {
+        database.exec('COMMIT;');
+        return false;
+      }
+      const recordStatement = database.prepare(
+        'INSERT INTO pk_records(id, project_id, type, state, authority, payload_json, source_versions_json, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET project_id = excluded.project_id, type = excluded.type, state = excluded.state, authority = excluded.authority, payload_json = excluded.payload_json, source_versions_json = excluded.source_versions_json, updated_at = excluded.updated_at WHERE pk_records.updated_at < excluded.updated_at',
+      );
+      const existingRecordStatement = database.prepare(
+        'SELECT updated_at FROM pk_records WHERE id = ?',
+      );
+      const migrateStateFor = new Set<string>();
+      const replaceStateFor = new Set<string>();
+      for (const record of records) {
+        const existing = existingRecordStatement.get(record.id) as
+          | { updated_at: string }
+          | undefined;
+        const legacyWins = existing === undefined || existing.updated_at < record.updatedAt;
+        recordStatement.run(...record.values);
+        if (legacyWins) migrateStateFor.add(record.id);
+        if (existing !== undefined && legacyWins) replaceStateFor.add(record.id);
+      }
+
+      const deleteOutcomesStatement = database.prepare(
+        'DELETE FROM pk_application_outcomes WHERE record_id = ?',
+      );
+      const deleteFeedbackStatement = database.prepare(
+        'DELETE FROM pk_feedback_state WHERE record_id = ?',
+      );
+      for (const recordId of replaceStateFor) {
+        deleteOutcomesStatement.run(recordId);
+        deleteFeedbackStatement.run(recordId);
+      }
+
+      const mutationStatement = database.prepare(
+        'INSERT OR IGNORE INTO pk_applied_mutations(mutation_key, applied_at) VALUES (?, ?)',
+      );
+      for (const mutation of snapshot.appliedMutations) {
+        mutationStatement.run(mutation.mutationKey, mutation.appliedAt);
+      }
+
+      const outcomeStatement = database.prepare(
+        'INSERT INTO pk_application_outcomes(record_id, application_id, status, revision) VALUES (?, ?, ?, ?) ON CONFLICT(record_id, application_id) DO UPDATE SET status = excluded.status, revision = excluded.revision WHERE pk_application_outcomes.revision < excluded.revision',
+      );
+      for (const outcome of snapshot.applicationOutcomes) {
+        if (!migrateStateFor.has(outcome.recordId)) continue;
+        outcomeStatement.run(
+          outcome.recordId,
+          outcome.applicationId,
+          outcome.status,
+          outcome.revision,
+        );
+      }
+
+      const feedbackStatement = database.prepare(
+        'INSERT OR IGNORE INTO pk_feedback_state(record_id, base_state) VALUES (?, ?)',
+      );
+      for (const feedback of snapshot.feedbackStates) {
+        if (!migrateStateFor.has(feedback.recordId)) continue;
+        feedbackStatement.run(feedback.recordId, feedback.baseState);
+      }
+      if (migrationKey !== undefined) {
+        database
+          .prepare('INSERT INTO pk_meta(key, value) VALUES (?, ?)')
+          .run(migrationKey, 'complete');
+      }
+      database.exec('COMMIT;');
+      return true;
+    } catch (error) {
+      database.exec('ROLLBACK;');
+      throw error;
+    }
   }
 
   searchRecords(query: ProjectKnowledgeQuery): readonly ProjectKnowledgeResult[] {
@@ -991,6 +1204,94 @@ export class ProjectKnowledgeLocalStore {
   private requireDatabase(): ProjectKnowledgeDatabase {
     if (!this.database) throw new Error('Project knowledge local store is closed');
     return this.database;
+  }
+}
+
+export async function readProjectKnowledgeStoreSnapshot(
+  databasePath: string,
+): Promise<ProjectKnowledgeStoreSnapshot> {
+  const staged = projectKnowledgeDatabaseBackupAvailable()
+    ? await stageDatabaseSnapshot(databasePath)
+    : undefined;
+  try {
+    const database = openProjectKnowledgeDatabase(staged?.databasePath ?? databasePath, {
+      readOnly: true,
+    });
+    try {
+      database.exec('BEGIN;');
+      try {
+        const metadata = database
+          .prepare("SELECT value FROM pk_meta WHERE key = 'schema_version'")
+          .get() as { value?: unknown } | undefined;
+        if (metadata?.value !== PROJECT_KNOWLEDGE_SCHEMA_VERSION) {
+          throw new Error('Legacy project knowledge database schema is incompatible');
+        }
+        const records = (
+          database
+            .prepare('SELECT payload_json FROM pk_records')
+            .all() as unknown as StoredRecordRow[]
+        ).map((row) => parseProjectKnowledgeRecord(JSON.parse(row.payload_json)));
+        const recordIds = new Set(records.map((record) => record.id));
+        const appliedMutations = (
+          database
+            .prepare('SELECT mutation_key, applied_at FROM pk_applied_mutations')
+            .all() as unknown as StoredAppliedMutationRow[]
+        ).map((row) => {
+          const mutationKey = snapshotIdentifier(row.mutation_key);
+          const appliedAt = snapshotTimestamp(row.applied_at);
+          if (mutationKey === undefined || appliedAt === undefined) {
+            throw new Error('Legacy project knowledge mutation state is invalid');
+          }
+          return { mutationKey, appliedAt };
+        });
+        const applicationOutcomes = (
+          database
+            .prepare(
+              'SELECT record_id, application_id, status, revision FROM pk_application_outcomes',
+            )
+            .all() as unknown as StoredApplicationOutcomeRow[]
+        ).map((row) => {
+          const recordId = snapshotIdentifier(row.record_id);
+          const applicationId = snapshotIdentifier(row.application_id);
+          const status = snapshotOutcomeStatus(row.status);
+          const revision = row.revision;
+          if (
+            recordId === undefined ||
+            !recordIds.has(recordId) ||
+            applicationId === undefined ||
+            status === undefined ||
+            !Number.isSafeInteger(revision) ||
+            Number(revision) < 1
+          ) {
+            throw new Error('Legacy project knowledge application outcome is invalid');
+          }
+          return { recordId, applicationId, status, revision: Number(revision) };
+        });
+        const feedbackStates = (
+          database
+            .prepare('SELECT record_id, base_state FROM pk_feedback_state')
+            .all() as unknown as StoredFeedbackStateRow[]
+        ).map((row) => {
+          const recordId = snapshotIdentifier(row.record_id);
+          const baseState = snapshotRecordState(row.base_state);
+          if (recordId === undefined || !recordIds.has(recordId) || baseState === undefined) {
+            throw new Error('Legacy project knowledge feedback state is invalid');
+          }
+          return { recordId, baseState };
+        });
+        database.exec('COMMIT;');
+        return { records, appliedMutations, applicationOutcomes, feedbackStates };
+      } catch (error) {
+        database.exec('ROLLBACK;');
+        throw error;
+      }
+    } finally {
+      database.close();
+    }
+  } finally {
+    if (staged !== undefined) {
+      rmSync(staged.temporaryRoot, { recursive: true, force: true });
+    }
   }
 }
 
