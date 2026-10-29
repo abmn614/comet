@@ -738,6 +738,54 @@ Run the focused Native checks.
     });
   });
 
+  it('does not let an unrelated Shape removal hide a declared target Spec', async () => {
+    const projectRoot = path.join(root, 'unrelated-removal-project');
+    await fs.mkdir(path.join(projectRoot, '.git'), { recursive: true });
+    await writeProjectConfig(projectRoot, defaultProjectConfig('docs', 'en'));
+    const paths = await nativeProjectPaths(projectRoot, 'docs');
+    await ensureNativeDirectories(paths);
+    const state = await createNativePortableChange({
+      paths,
+      name: 'unrelated-removal-change',
+      language: 'en',
+    });
+    const changeDir = nativePortableChangeDir(paths, state.name);
+    await fs.writeFile(path.join(changeDir, 'brief.md'), completeBrief);
+    const declared = {
+      capability: 'declared-capability',
+      operation: 'modify' as const,
+      source: 'specs/declared-capability/spec.md',
+    };
+    const remove = (capability: string) => ({
+      capability,
+      operation: 'remove' as const,
+      source: null,
+    });
+
+    await expect(
+      validateNativePortableDocuments({
+        paths,
+        state: { ...state, spec_changes: [declared] },
+        specChanges: [remove('legacy-capability')],
+      }),
+    ).resolves.toMatchObject({
+      valid: false,
+      findings: [
+        expect.objectContaining({
+          code: 'spec-document-missing',
+          path: 'specs/declared-capability/spec.md',
+        }),
+      ],
+    });
+    await expect(
+      validateNativePortableDocuments({
+        paths,
+        state: { ...state, spec_changes: [declared] },
+        specChanges: [remove('declared-capability')],
+      }),
+    ).resolves.toMatchObject({ valid: true, findings: [] });
+  });
+
   it('covers reject-repair-retry for exemption, target content, and formal path checks', async () => {
     const projectRoot = path.join(root, 'repair-matrix-project');
     await fs.mkdir(path.join(projectRoot, '.git'), { recursive: true });
