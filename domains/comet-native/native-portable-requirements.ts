@@ -255,12 +255,19 @@ export async function validateNativePortableDocuments(options: {
     ({ operation }) => operation !== 'remove',
   );
   const discoveredCapabilities = new Set(targetSpecs.map(({ capability }) => capability));
-  if (options.specChanges !== undefined) {
+  // Before Shape confirmation the declared set is only the last prepared proposal, so a
+  // replacement target Spec or formal remove entry may supersede it. An exemption alone
+  // still cannot hide a declared Spec that disappeared.
+  const shapeRetargeted = options.state.phase === 'shape' && specChanges.length > 0;
+  if (options.specChanges !== undefined && !shapeRetargeted) {
     for (const declared of declaredTargetSpecs) {
       if (discoveredCapabilities.has(declared.capability)) continue;
       findings.push({
         code: 'spec-document-missing',
-        message: `Previously declared target Spec is missing: specs/${declared.capability}/spec.md. Restore the complete file or record the intended capability deletion as a formal remove entry.`,
+        message:
+          options.state.phase === 'shape'
+            ? `Previously declared target Spec is missing: specs/${declared.capability}/spec.md. Restore the complete file, stage the replacement target Spec under specs/<capability>/spec.md, or record the intended capability deletion as a formal remove entry.`
+            : `Previously declared target Spec is missing: specs/${declared.capability}/spec.md. Restore the complete file or record the intended capability deletion as a formal remove entry.`,
         path: `specs/${declared.capability}/spec.md`,
       });
     }
