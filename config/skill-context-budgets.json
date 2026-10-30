@@ -1,0 +1,30 @@
+{
+  "schema": "comet.skill-context-budgets.v1",
+  "description": "Estimated token ceilings for shipped agent-facing text. Overrides pin files that already exceed the default at their current size plus about 5%; shrink a file and lower or remove its override. Estimates come from scripts/benchmark/skill-context-budget.mjs and are heuristic, not tokenizer counts.",
+  "defaults": {
+    "rule": 3000,
+    "skill": 5000,
+    "reference": 5000,
+    "description": 100
+  },
+  "overrides": {
+    "assets/skills-zh/comet-native/reference/commands.md": 17100,
+    "assets/skills/comet-native/reference/commands.md": 15200,
+    "assets/skills-zh/comet-build/reference/compat.md": 7900,
+    "assets/skills/comet-build/reference/compat.md": 7400,
+    "assets/skills-zh/comet-open/SKILL.md": 7400,
+    "assets/skills/comet-classic/reference/comet-yaml-fields.md": 6800,
+    "assets/skills-zh/comet-tweak/reference/compat.md": 6600,
+    "assets/skills/comet-open/SKILL.md": 6500,
+    "assets/skills-zh/comet-hotfix/reference/compat.md": 6500,
+    "assets/skills-zh/comet-verify/reference/compat.md": 6100,
+    "assets/skills/comet-tweak/reference/compat.md": 5700,
+    "assets/skills-zh/comet-classic/reference/scripts.md": 5700,
+    "assets/skills/comet-hotfix/reference/compat.md": 5600,
+    "assets/skills-zh/comet-native/SKILL.md": 5600,
+    "assets/skills-zh/comet-classic/reference/context-recovery.md": 5600,
+    "assets/skills-zh/comet-classic/reference/comet-yaml-fields.md": 5500,
+    "assets/skills/comet-classic/reference/context-recovery.md": 5400,
+    "assets/skills-zh/comet-archive/reference/compat.md": 5300
+  }
+}

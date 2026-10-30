@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from scaffold.python.context_attribution import attribute_context_sources
 from scaffold.python.evidence import stable_treatment_name
 from scaffold.python.execution import redact_sensitive
 from scaffold.python.paths import get_runs_dir
@@ -363,6 +364,7 @@ def extract_events(parsed: dict[str, Any], *, agent: str | None = None) -> dict[
         if call["tool"] == "Bash" and isinstance(call["input"], dict)
         and isinstance(call["input"].get("command"), str) and call["input"]["command"]
     ]
+    events["context_sources"] = attribute_context_sources(events["tool_calls"])
     return redact_sensitive(events)
 
 
